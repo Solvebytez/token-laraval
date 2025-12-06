@@ -475,4 +475,119 @@ class TokenDataController extends Controller
             ], 500);
         }
     }
+
+    /**
+     * Update token data record
+     */
+    public function update(Request $request, $id): JsonResponse
+    {
+        try {
+            // Check if user is authenticated
+            if (!auth()->check()) {
+                Log::warning('Unauthenticated request to update', ['ip' => request()->ip()]);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unauthenticated',
+                ], 401);
+            }
+
+            $userId = auth()->id();
+            if (!$userId) {
+                Log::error('User ID is null in update', ['ip' => request()->ip()]);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'User not found',
+                ], 401);
+            }
+
+            // Find the token data record and verify it belongs to the user
+            $tokenData = TokenData::forUser($userId)->find($id);
+
+            if (!$tokenData) {
+                Log::warning('Token data not found or unauthorized', [
+                    'id' => $id,
+                    'user_id' => $userId,
+                    'ip' => request()->ip(),
+                ]);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Token data not found or unauthorized',
+                ], 404);
+            }
+
+            // Validate request
+            $validator = Validator::make($request->all(), [
+                'entries' => 'required|array',
+                'entries.*.number' => 'required|integer|min:0|max:9',
+                'entries.*.quantity' => 'required|integer|min:1',
+                'entries.*.timestamp' => 'required|integer',
+            ]);
+
+            if ($validator->fails()) {
+                Log::warning('❌ TokenData Update Validation Failed', [
+                    'user_id' => $userId,
+                    'errors' => $validator->errors()->toArray(),
+                    'input' => $request->all(),
+                ]);
+
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation failed',
+                    'errors' => $validator->errors(),
+                ], 422);
+            }
+
+            // Recalculate counts from entries
+            $counts = [];
+            for ($i = 0; $i < 10; $i++) {
+                $counts[$i] = 0;
+            }
+            foreach ($request->entries as $entry) {
+                if (isset($entry['number']) && isset($entry['quantity'])) {
+                    $number = (int)$entry['number'];
+                    $quantity = (int)$entry['quantity'];
+                    if ($number >= 0 && $number <= 9) {
+                        $counts[$number] += $quantity;
+                    }
+                }
+            }
+
+            // Update the record
+            $tokenData->update([
+                'entries' => $request->entries,
+                'counts' => $counts,
+                'saved_at' => now(),
+            ]);
+
+            Log::info('✅ TokenData Updated Successfully', [
+                'user_id' => $userId,
+                'token_data_id' => $tokenData->id,
+                'time_slot_id' => $tokenData->time_slot_id,
+                'date' => $tokenData->date,
+                'time_slot' => $tokenData->time_slot,
+                'entries_count' => count($request->entries),
+                'updated_at' => now()->toDateTimeString(),
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Token data updated successfully',
+                'data' => $tokenData->fresh(),
+            ], 200);
+
+        } catch (\Exception $e) {
+            Log::error('Error updating token data', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+                'id' => $id,
+                'user_id' => auth()->id(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to update token data',
+                'error' => config('app.debug') ? $e->getMessage() : 'Internal server error',
+            ], 500);
+        }
+    }
 }

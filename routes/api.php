@@ -26,6 +26,9 @@ Route::prefix('v1')->middleware('auth:api')->group(function () {
     Route::get('/token-data/date/{date}', [TokenDataController::class, 'getByDate']);
     Route::get('/token-data/range', [TokenDataController::class, 'getByDateRange']);
     
+    // Token data update route
+    Route::put('/token-data/{id}', [TokenDataController::class, 'update']);
+    
     // Token data delete route
     Route::delete('/token-data/{id}', [TokenDataController::class, 'destroy']);
     
