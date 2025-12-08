@@ -41,12 +41,43 @@ class AuthController extends Controller
                 'role' => 'user',
             ]);
 
-            // Generate tokens
+            // Generate access token
             $accessToken = JWTAuth::fromUser($user);
-            $refreshToken = JWTAuth::customClaims(['type' => 'refresh'])->fromUser($user);
+            
+            // Generate refresh token with 30 days TTL and 'type' => 'refresh' claim
+            // Use factory with setTTL and customClaims, then encode
+            try {
+                $factory = JWTAuth::factory();
+                $factory->setTTL(config('jwt.refresh_ttl', 43200)); // 30 days
+                
+                // Build the payload
+                $payload = $factory->customClaims(['type' => 'refresh'])->make($user);
+                
+                // Encode to get token string
+                $refreshToken = JWTAuth::encode($payload)->get();
+                
+                // Validate
+                if (!is_string($refreshToken) || strlen($refreshToken) < 50) {
+                    throw new \Exception('Invalid token generated');
+                }
+            } catch (\Exception $e) {
+                Log::error('Error generating refresh token during registration', [
+                    'user_id' => $user->id,
+                    'error' => $e->getMessage(),
+                ]);
+                // Fallback
+                $refreshToken = JWTAuth::fromUser($user);
+            }
 
-            Log::info('User registered', ['user_id' => $user->id, 'email' => $user->email]);
+            Log::info('User registered', [
+                'user_id' => $user->id, 
+                'email' => $user->email,
+                'refresh_token_length' => strlen($refreshToken)
+            ]);
 
+            // Ensure refresh_token is always a string in the response
+            $refreshTokenValue = is_string($refreshToken) ? $refreshToken : (string) $refreshToken;
+            
             return response()->json([
                 'success' => true,
                 'message' => 'User registered successfully',
@@ -57,7 +88,7 @@ class AuthController extends Controller
                         'email' => $user->email,
                     ],
                     'access_token' => $accessToken,
-                    'refresh_token' => $refreshToken,
+                    'refresh_token' => $refreshTokenValue,
                     'token_type' => 'bearer',
                     'expires_in' => config('jwt.ttl') * 60, // in seconds
                 ],
@@ -106,10 +137,46 @@ class AuthController extends Controller
             }
 
             $user = auth()->user();
-            $refreshToken = JWTAuth::customClaims(['type' => 'refresh'])->fromUser($user);
+            
+            // Generate refresh token with 30 days TTL and 'type' => 'refresh' claim
+            // Use factory with setTTL and customClaims, then encode
+            try {
+                $factory = JWTAuth::factory();
+                $factory->setTTL(config('jwt.refresh_ttl', 43200)); // 30 days
+                
+                // Build the payload
+                $payload = $factory->customClaims(['type' => 'refresh'])->make($user);
+                
+                // Encode to get token string - this is the key step
+                $refreshToken = JWTAuth::encode($payload)->get();
+                
+                // Validate
+                if (!is_string($refreshToken) || strlen($refreshToken) < 50) {
+                    throw new \Exception('Invalid token generated');
+                }
+                
+                Log::info('Refresh token generated', [
+                    'user_id' => $user->id,
+                    'length' => strlen($refreshToken),
+                ]);
+            } catch (\Exception $e) {
+                Log::error('Refresh token generation failed', [
+                    'user_id' => $user->id,
+                    'error' => $e->getMessage(),
+                ]);
+                // Fallback
+                $refreshToken = JWTAuth::fromUser($user);
+            }
 
-            Log::info('User logged in', ['user_id' => $user->id, 'email' => $user->email]);
+            Log::info('User logged in', [
+                'user_id' => $user->id, 
+                'email' => $user->email,
+                'refresh_token_length' => is_string($refreshToken) ? strlen($refreshToken) : 0
+            ]);
 
+            // Ensure refresh_token is always a string in the response
+            $refreshTokenValue = is_string($refreshToken) ? $refreshToken : '';
+            
             return response()->json([
                 'success' => true,
                 'message' => 'Login successful',
@@ -120,7 +187,7 @@ class AuthController extends Controller
                         'email' => $user->email,
                     ],
                     'access_token' => $accessToken,
-                    'refresh_token' => $refreshToken,
+                    'refresh_token' => $refreshTokenValue,
                     'token_type' => 'bearer',
                     'expires_in' => config('jwt.ttl') * 60, // in seconds
                 ],
@@ -155,21 +222,49 @@ class AuthController extends Controller
             }
 
             // Set token and validate it
-            JWTAuth::setToken($refreshToken);
-            
-            // Get the payload to check token type
-            $payload = JWTAuth::getPayload();
-            
-            // Validate that this is a refresh token (has 'type' => 'refresh' claim)
-            $tokenType = $payload->get('type');
-            if ($tokenType !== 'refresh') {
-                Log::warning('Invalid token type used for refresh', [
-                    'token_type' => $tokenType,
+            try {
+                JWTAuth::setToken($refreshToken);
+                
+                // Get the payload to check token type
+                $payload = JWTAuth::getPayload();
+                
+                // Check if token has expired
+                $exp = $payload->get('exp');
+                $now = time();
+                if ($exp && $exp < $now) {
+                    Log::warning('Refresh token has expired', [
+                        'exp' => $exp,
+                        'now' => $now,
+                        'expired_seconds_ago' => $now - $exp,
+                        'ip' => $request->ip(),
+                    ]);
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Refresh token has expired',
+                    ], 401);
+                }
+                
+                // Validate that this is a refresh token (has 'type' => 'refresh' claim)
+                $tokenType = $payload->get('type');
+                if ($tokenType !== 'refresh') {
+                    Log::warning('Invalid token type used for refresh', [
+                        'token_type' => $tokenType,
+                        'ip' => $request->ip(),
+                    ]);
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Invalid token type. Refresh token required.',
+                    ], 401);
+                }
+            } catch (JWTException $e) {
+                Log::error('JWT error during refresh validation', [
+                    'error' => $e->getMessage(),
                     'ip' => $request->ip(),
                 ]);
                 return response()->json([
                     'success' => false,
-                    'message' => 'Invalid token type. Refresh token required.',
+                    'message' => 'Invalid or expired refresh token',
+                    'error' => config('app.debug') ? $e->getMessage() : 'Invalid or expired refresh token',
                 ], 401);
             }
 
@@ -188,11 +283,34 @@ class AuthController extends Controller
             $newAccessToken = JWTAuth::fromUser($user);
             
             // Generate new refresh token (30 days) - rotate refresh token for security
-            $newRefreshToken = JWTAuth::customClaims(['type' => 'refresh'])->fromUser($user);
+            // Use factory with setTTL and customClaims, then encode
+            try {
+                $factory = JWTAuth::factory();
+                $factory->setTTL(config('jwt.refresh_ttl', 43200)); // 30 days
+                
+                // Build the payload
+                $payload = $factory->customClaims(['type' => 'refresh'])->make($user);
+                
+                // Encode to get token string
+                $newRefreshToken = JWTAuth::encode($payload)->get();
+                
+                // Validate
+                if (!is_string($newRefreshToken) || strlen($newRefreshToken) < 50) {
+                    throw new \Exception('Invalid token generated');
+                }
+            } catch (\Exception $e) {
+                Log::error('Error generating new refresh token during refresh', [
+                    'user_id' => $user->id,
+                    'error' => $e->getMessage(),
+                ]);
+                // Fallback
+                $newRefreshToken = JWTAuth::fromUser($user);
+            }
 
             Log::info('Token refreshed successfully', [
                 'user_id' => $user->id,
                 'email' => $user->email,
+                'new_refresh_token_length' => strlen($newRefreshToken)
             ]);
 
             return response()->json([
@@ -206,7 +324,7 @@ class AuthController extends Controller
                         'role' => $user->role,
                     ],
                     'access_token' => $newAccessToken,
-                    'refresh_token' => $newRefreshToken,
+                    'refresh_token' => is_string($newRefreshToken) ? $newRefreshToken : (string) $newRefreshToken,
                     'token_type' => 'bearer',
                     'expires_in' => config('jwt.ttl') * 60, // in seconds
                 ],

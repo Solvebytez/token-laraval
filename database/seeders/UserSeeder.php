@@ -23,6 +23,17 @@ class UserSeeder extends Seeder
             ]
         );
 
+        // Create abhi037@gmail.com user
+        User::firstOrCreate(
+            ['email' => 'abhi037@gmail.com'],
+            [
+                'name' => 'Abhi User',
+                'password' => Hash::make('Sa@1234567'),
+                'role' => 'user',
+            ]
+        );
+
         $this->command->info('Test user created: sahinh013@gmail.com / Sa@1234567');
+        $this->command->info('User created: abhi037@gmail.com / Sa@1234567');
     }
 }

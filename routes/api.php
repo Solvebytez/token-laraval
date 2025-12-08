@@ -11,6 +11,13 @@ use App\Http\Controllers\Api\AuthController;
 |--------------------------------------------------------------------------
 */
 
+Route::get('/v1', function () {
+    return response()->json([
+        'status' => 'OK',
+        'message' => 'Token Tracker API is running'
+    ]);
+});
+
 // Public routes (no authentication required)
 Route::prefix('v1')->group(function () {
     // Authentication routes
