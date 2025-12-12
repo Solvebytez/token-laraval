@@ -23,17 +23,17 @@ class UserSeeder extends Seeder
             ]
         );
 
-        // Create abhi037@gmail.com user
+        // Create abhi037@gmail.com user as admin
         User::firstOrCreate(
             ['email' => 'abhi037@gmail.com'],
             [
-                'name' => 'Abhi User',
+                'name' => 'Abhi Admin',
                 'password' => Hash::make('Sa@1234567'),
-                'role' => 'user',
+                'role' => 'admin',
             ]
         );
 
         $this->command->info('Test user created: sahinh013@gmail.com / Sa@1234567');
-        $this->command->info('User created: abhi037@gmail.com / Sa@1234567');
+        $this->command->info('Admin user created: abhi037@gmail.com / Sa@1234567');
     }
 }

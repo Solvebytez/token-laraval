@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\Log;
 use Tymon\JWTAuth\Facades\JWTAuth;
 use Tymon\JWTAuth\Exceptions\JWTException;
+use Carbon\Carbon;
 
 class TokenDataController extends Controller
 {
@@ -303,6 +304,364 @@ class TokenDataController extends Controller
     }
 
     /**
+     * Generate all time slots for a day
+     * 9:00-11:00 AM: 15-minute intervals
+     * 11:00 AM-9:40 PM: 20-minute intervals
+     */
+    private function generateTimeSlots(): array
+    {
+        $slots = [];
+        
+        // 9:00 AM to 11:00 AM - 15 minute intervals
+        for ($hour = 9; $hour < 11; $hour++) {
+            for ($minute = 0; $minute < 60; $minute += 15) {
+                $slots[] = sprintf('%02d:%02d', $hour, $minute);
+            }
+        }
+        // 11:00 AM (only add once)
+        $slots[] = '11:00';
+        
+        // 11:00 AM to 9:40 PM - 20 minute intervals (start from 11:20 to avoid duplicate 11:00)
+        for ($hour = 11; $hour < 22; $hour++) {
+            // For hour 11, start from minute 20 to avoid duplicate 11:00
+            $startMinute = $hour === 11 ? 20 : 0;
+            for ($minute = $startMinute; $minute < 60; $minute += 20) {
+                // Stop at 9:40 PM (21:40)
+                if ($hour === 21 && $minute > 40) {
+                    break;
+                }
+                $slots[] = sprintf('%02d:%02d', $hour, $minute);
+                // Break after 21:40
+                if ($hour === 21 && $minute === 40) {
+                    break 2; // Break both loops
+                }
+            }
+            // Break outer loop after 21:40
+            if ($hour === 21) {
+                break;
+            }
+        }
+        
+        return $slots;
+    }
+
+    /**
+     * Calculate missing time slots between last record and current time
+     */
+    private function calculateMissingTimeSlots($lastRecord, $currentTime): array
+    {
+        $missingSlots = [];
+        $allSlots = $this->generateTimeSlots();
+        
+        // Get last record's date and time slot
+        $lastDate = Carbon::parse($lastRecord->date);
+        $lastTimeSlot = $lastRecord->time_slot;
+        
+        // Find index of last time slot in the slots array
+        $lastSlotIndex = array_search($lastTimeSlot, $allSlots);
+        if ($lastSlotIndex === false) {
+            // If last slot not found, start from first slot of last date
+            $lastSlotIndex = -1;
+        }
+        
+        // Start from the next slot after the last one
+        $startSlotIndex = $lastSlotIndex + 1;
+        
+        // Get current date and time
+        $currentDate = now();
+        $currentHour = (int)$currentDate->format('H');
+        $currentMinute = (int)$currentDate->format('i');
+        $currentTimeMinutes = $currentHour * 60 + $currentMinute;
+        
+        // Calculate which slot we're currently in, or the last slot that has passed
+        $currentSlotIndex = -1;
+        $lastPassedSlotIndex = -1;
+        
+        foreach ($allSlots as $index => $slot) {
+            [$slotHour, $slotMinute] = explode(':', $slot);
+            $slotTimeMinutes = (int)$slotHour * 60 + (int)$slotMinute;
+            
+            // Track the last slot that has passed
+            if ($currentTimeMinutes >= $slotTimeMinutes) {
+                $lastPassedSlotIndex = $index;
+                
+                // Check if we're currently in this slot (before next slot starts)
+                if ($index < count($allSlots) - 1) {
+                    [$nextHour, $nextMinute] = explode(':', $allSlots[$index + 1]);
+                    $nextSlotTimeMinutes = (int)$nextHour * 60 + (int)$nextMinute;
+                    if ($currentTimeMinutes < $nextSlotTimeMinutes) {
+                        $currentSlotIndex = $index;
+                        // Don't break - continue to find last passed slot
+                    }
+                } else {
+                    // Last slot - check if we're before 22:00 (10:00 PM)
+                    if ($currentTimeMinutes < 22 * 60) {
+                        $currentSlotIndex = $index;
+                    }
+                }
+            }
+        }
+        
+        // If before first slot (before 9:00 AM), don't create slots for today
+        if ($currentTimeMinutes < 9 * 60) {
+            $currentSlotIndex = -1;
+            $lastPassedSlotIndex = -1;
+        }
+        
+        // If after last slot (after 22:00), use the last slot index
+        if ($currentTimeMinutes >= 22 * 60) {
+            $currentSlotIndex = -1;
+            // Keep lastPassedSlotIndex as the last slot of the day
+        }
+        
+        // Use current slot if found, otherwise use last passed slot
+        $targetSlotIndex = $currentSlotIndex >= 0 ? $currentSlotIndex : $lastPassedSlotIndex;
+        
+        // Generate missing slots from last record date to current date
+        $dateIterator = $lastDate->copy();
+        $endDate = $currentDate->copy();
+        
+        while ($dateIterator->lte($endDate)) {
+            $dateStr = $dateIterator->format('Y-m-d');
+            $isLastDate = $dateIterator->isSameDay($endDate);
+            $isFirstDate = $dateIterator->isSameDay($lastDate);
+            
+            // Determine which slots to process for this date
+            $slotsToProcess = [];
+            
+            if ($isFirstDate && $isLastDate) {
+                // Same day - only process slots between last slot and target slot (current or last passed)
+                if ($targetSlotIndex >= $startSlotIndex) {
+                    for ($i = $startSlotIndex; $i <= $targetSlotIndex && $i < count($allSlots); $i++) {
+                        $slotsToProcess[] = $allSlots[$i];
+                    }
+                }
+            } elseif ($isFirstDate) {
+                // First date - process from next slot after last to end of day
+                for ($i = $startSlotIndex; $i < count($allSlots); $i++) {
+                    $slotsToProcess[] = $allSlots[$i];
+                }
+            } elseif ($isLastDate) {
+                // Last date - process from first slot to target slot
+                if ($targetSlotIndex >= 0) {
+                    for ($i = 0; $i <= $targetSlotIndex && $i < count($allSlots); $i++) {
+                        $slotsToProcess[] = $allSlots[$i];
+                    }
+                }
+            } else {
+                // Middle dates - process all slots
+                $slotsToProcess = $allSlots;
+            }
+            
+            // Add missing slots for this date
+            foreach ($slotsToProcess as $slot) {
+                $timeSlotId = $dateStr . '_' . $slot;
+                $missingSlots[] = [
+                    'time_slot_id' => $timeSlotId,
+                    'date' => $dateStr,
+                    'time_slot' => $slot,
+                ];
+            }
+            
+            // Move to next day
+            $dateIterator->addDay();
+        }
+        
+        return $missingSlots;
+    }
+
+    /**
+     * Create missing time slot records with 0 quantities
+     * 
+     * Note: All time calculations use IST (Asia/Kolkata) timezone
+     * as configured in config/app.php. This ensures consistent
+     * time slot calculations for all users in India.
+     */
+    private function createMissingTimeSlots(int $userId): void
+    {
+        try {
+            // Get last saved record for this user
+            // All times are in IST (Asia/Kolkata) timezone
+            $lastRecord = TokenData::forUser($userId)
+                ->orderBy('date', 'desc')
+                ->orderBy('time_slot', 'desc')
+                ->first();
+            
+            // If no last record, create slots from today's first slot to current slot
+            if (!$lastRecord) {
+                $allSlots = $this->generateTimeSlots();
+                $currentDate = now();
+                $currentHour = (int)$currentDate->format('H');
+                $currentMinute = (int)$currentDate->format('i');
+                $currentTimeMinutes = $currentHour * 60 + $currentMinute;
+                
+                // Find current slot index
+                $currentSlotIndex = -1;
+                foreach ($allSlots as $index => $slot) {
+                    [$slotHour, $slotMinute] = explode(':', $slot);
+                    $slotTimeMinutes = (int)$slotHour * 60 + (int)$slotMinute;
+                    
+                    if ($currentTimeMinutes >= $slotTimeMinutes) {
+                        if ($index < count($allSlots) - 1) {
+                            [$nextHour, $nextMinute] = explode(':', $allSlots[$index + 1]);
+                            $nextSlotTimeMinutes = (int)$nextHour * 60 + (int)$nextMinute;
+                            if ($currentTimeMinutes < $nextSlotTimeMinutes) {
+                                $currentSlotIndex = $index;
+                                break;
+                            }
+                        } else {
+                            if ($currentTimeMinutes < 22 * 60) {
+                                $currentSlotIndex = $index;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Only create slots if we're within valid time range (9:00 AM - 10:00 PM)
+                if ($currentSlotIndex >= 0 && $currentTimeMinutes >= 9 * 60 && $currentTimeMinutes < 22 * 60) {
+                    $dateStr = $currentDate->format('Y-m-d');
+                    $zeroCounts = array_fill(0, 10, 0);
+                    
+                    for ($i = 0; $i <= $currentSlotIndex; $i++) {
+                        $slot = $allSlots[$i];
+                        $timeSlotId = $dateStr . '_' . $slot;
+                        
+                        TokenData::firstOrCreate(
+                            [
+                                'user_id' => $userId,
+                                'time_slot_id' => $timeSlotId,
+                            ],
+                            [
+                                'date' => $dateStr,
+                                'time_slot' => $slot,
+                                'entries' => [],
+                                'counts' => $zeroCounts,
+                                'saved_at' => now(),
+                            ]
+                        );
+                    }
+                    
+                    Log::info('✅ Created missing time slots for new user', [
+                        'user_id' => $userId,
+                        'slots_created' => $currentSlotIndex + 1,
+                    ]);
+                }
+                
+                return;
+            }
+            
+            // Calculate missing slots from last record to now
+            $missingSlots = $this->calculateMissingTimeSlots($lastRecord, now());
+            
+            Log::info('🔍 Checking for missing time slots', [
+                'user_id' => $userId,
+                'last_record_date' => $lastRecord->date,
+                'last_record_time_slot' => $lastRecord->time_slot,
+                'missing_slots_count' => count($missingSlots),
+                'missing_slots' => $missingSlots,
+            ]);
+            
+            if (empty($missingSlots)) {
+                // No missing slots
+                Log::info('ℹ️ No missing time slots found', [
+                    'user_id' => $userId,
+                ]);
+                return;
+            }
+            
+            // Create records for missing slots
+            $zeroCounts = array_fill(0, 10, 0);
+            $createdCount = 0;
+            
+            foreach ($missingSlots as $slotData) {
+                try {
+                    // First check if record exists for this user
+                    $existing = TokenData::where('user_id', $userId)
+                        ->where('time_slot_id', $slotData['time_slot_id'])
+                        ->first();
+                    
+                    if ($existing) {
+                        Log::info('ℹ️ Time slot already exists', [
+                            'user_id' => $userId,
+                            'time_slot_id' => $slotData['time_slot_id'],
+                        ]);
+                        continue;
+                    }
+                    
+                    // Try to create the record
+                    $created = TokenData::create([
+                        'user_id' => $userId,
+                        'time_slot_id' => $slotData['time_slot_id'],
+                        'date' => $slotData['date'],
+                        'time_slot' => $slotData['time_slot'],
+                        'entries' => [],
+                        'counts' => $zeroCounts,
+                        'saved_at' => now(),
+                    ]);
+                    
+                    $createdCount++;
+                    Log::info('✅ Created missing time slot record', [
+                        'user_id' => $userId,
+                        'time_slot_id' => $slotData['time_slot_id'],
+                        'date' => $slotData['date'],
+                        'time_slot' => $slotData['time_slot'],
+                    ]);
+                } catch (\Illuminate\Database\QueryException $e) {
+                    // Handle duplicate key error (unique constraint violation)
+                    if ($e->getCode() == 23000 || str_contains($e->getMessage(), 'Duplicate entry')) {
+                        // Check if it exists for this user now (race condition)
+                        $existing = TokenData::where('user_id', $userId)
+                            ->where('time_slot_id', $slotData['time_slot_id'])
+                            ->first();
+                        
+                        if ($existing) {
+                            Log::info('ℹ️ Time slot already exists (race condition)', [
+                                'user_id' => $userId,
+                                'time_slot_id' => $slotData['time_slot_id'],
+                            ]);
+                        } else {
+                            // Duplicate exists for different user - skip
+                            Log::warning('⚠️ Time slot exists for different user, skipping', [
+                                'user_id' => $userId,
+                                'time_slot_id' => $slotData['time_slot_id'],
+                                'error' => $e->getMessage(),
+                            ]);
+                        }
+                    } else {
+                        // Re-throw if it's a different error
+                        throw $e;
+                    }
+                }
+            }
+            
+            if ($createdCount > 0) {
+                Log::info('✅ Created missing time slots', [
+                    'user_id' => $userId,
+                    'slots_created' => $createdCount,
+                    'total_missing_slots' => count($missingSlots),
+                    'last_record_date' => $lastRecord->date,
+                    'last_record_time_slot' => $lastRecord->time_slot,
+                ]);
+            } else {
+                Log::info('ℹ️ All missing time slots already exist', [
+                    'user_id' => $userId,
+                    'total_missing_slots' => count($missingSlots),
+                ]);
+            }
+            
+        } catch (\Exception $e) {
+            Log::error('❌ Error creating missing time slots', [
+                'user_id' => $userId,
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+            // Don't throw - allow getAll to continue even if slot creation fails
+        }
+    }
+
+    /**
      * Get all token data with pagination and filters
      */
     public function getAll(Request $request): JsonResponse
@@ -325,6 +684,13 @@ class TokenDataController extends Controller
                     'message' => 'User not found',
                 ], 401);
             }
+
+            // Create missing time slots before querying (BEST APPROACH)
+            Log::info('🔍 getAll called - checking for missing time slots', [
+                'user_id' => $userId,
+                'timestamp' => now()->toDateTimeString(),
+            ]);
+            $this->createMissingTimeSlots($userId);
 
             $validator = Validator::make($request->all(), [
                 'page' => 'sometimes|integer|min:1',
