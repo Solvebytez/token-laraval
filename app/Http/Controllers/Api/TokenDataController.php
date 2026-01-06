@@ -357,6 +357,22 @@ class TokenDataController extends Controller
         $lastDate = Carbon::parse($lastRecord->date);
         $lastTimeSlot = $lastRecord->time_slot;
         
+        // Safety check: Limit to maximum 7 days to prevent timeouts
+        $currentDate = now();
+        $daysDiff = $lastDate->diffInDays($currentDate);
+        if ($daysDiff > 7) {
+            Log::warning('⚠️ Too many days between last record and now, limiting to 7 days', [
+                'last_record_date' => $lastDate->format('Y-m-d'),
+                'current_date' => $currentDate->format('Y-m-d'),
+                'days_diff' => $daysDiff,
+            ]);
+            // Limit to 7 days from last record
+            $currentDate = $lastDate->copy()->addDays(7);
+            if ($currentDate->isFuture()) {
+                $currentDate = now();
+            }
+        }
+        
         // Find index of last time slot in the slots array
         $lastSlotIndex = array_search($lastTimeSlot, $allSlots);
         if ($lastSlotIndex === false) {
@@ -367,8 +383,7 @@ class TokenDataController extends Controller
         // Start from the next slot after the last one
         $startSlotIndex = $lastSlotIndex + 1;
         
-        // Get current date and time
-        $currentDate = now();
+        // Get current date and time (may have been limited above)
         $currentHour = (int)$currentDate->format('H');
         $currentMinute = (int)$currentDate->format('i');
         $currentTimeMinutes = $currentHour * 60 + $currentMinute;
@@ -686,11 +701,41 @@ class TokenDataController extends Controller
             }
 
             // Create missing time slots before querying (BEST APPROACH)
-            Log::info('🔍 getAll called - checking for missing time slots', [
-                'user_id' => $userId,
-                'timestamp' => now()->toDateTimeString(),
-            ]);
-            $this->createMissingTimeSlots($userId);
+            // Only create missing slots if last record is within last 7 days to prevent timeouts
+            $lastRecord = TokenData::forUser($userId)
+                ->orderBy('date', 'desc')
+                ->orderBy('time_slot', 'desc')
+                ->first();
+            
+            $shouldCreateSlots = false;
+            if ($lastRecord) {
+                $daysSinceLastRecord = now()->diffInDays($lastRecord->date);
+                $shouldCreateSlots = $daysSinceLastRecord <= 7; // Only if within 7 days
+                
+                Log::info('🔍 getAll called - checking for missing time slots', [
+                    'user_id' => $userId,
+                    'last_record_date' => $lastRecord->date,
+                    'days_since_last_record' => $daysSinceLastRecord,
+                    'will_create_slots' => $shouldCreateSlots,
+                    'timestamp' => now()->toDateTimeString(),
+                ]);
+            } else {
+                // No records, safe to create slots for today
+                $shouldCreateSlots = true;
+                Log::info('🔍 getAll called - no previous records, will create slots for today', [
+                    'user_id' => $userId,
+                    'timestamp' => now()->toDateTimeString(),
+                ]);
+            }
+            
+            if ($shouldCreateSlots) {
+                $this->createMissingTimeSlots($userId);
+            } else {
+                Log::info('⏭️ Skipping createMissingTimeSlots - too many days since last record', [
+                    'user_id' => $userId,
+                    'days_since_last_record' => $lastRecord ? now()->diffInDays($lastRecord->date) : 0,
+                ]);
+            }
 
             $validator = Validator::make($request->all(), [
                 'page' => 'sometimes|integer|min:1',
@@ -848,6 +893,12 @@ class TokenDataController extends Controller
     public function update(Request $request, $id): JsonResponse
     {
         try {
+            Log::info('🔄 TokenData Update Request Received', [
+                'id' => $id,
+                'request_data' => $request->all(),
+                'ip' => request()->ip(),
+            ]);
+
             // Check if user is authenticated
             if (!auth()->check()) {
                 Log::warning('Unauthenticated request to update', ['ip' => request()->ip()]);
@@ -866,6 +917,11 @@ class TokenDataController extends Controller
                 ], 401);
             }
 
+            Log::info('🔍 Finding token data record', [
+                'id' => $id,
+                'user_id' => $userId,
+            ]);
+
             // Find the token data record and verify it belongs to the user
             $tokenData = TokenData::forUser($userId)->find($id);
 
@@ -881,13 +937,24 @@ class TokenDataController extends Controller
                 ], 404);
             }
 
-            // Validate request
-            $validator = Validator::make($request->all(), [
-                'entries' => 'required|array',
-                'entries.*.number' => 'required|integer|min:0|max:9',
-                'entries.*.quantity' => 'required|integer|min:1',
-                'entries.*.timestamp' => 'required|integer',
+            Log::info('✅ Token data record found', [
+                'id' => $tokenData->id,
+                'time_slot_id' => $tokenData->time_slot_id,
             ]);
+
+            // Validate request - only validate entries if present
+            $rules = [
+                'winner' => 'nullable|integer|min:0|max:9',
+            ];
+            
+            if ($request->has('entries')) {
+                $rules['entries'] = 'required|array';
+                $rules['entries.*.number'] = 'required|integer|min:0|max:9';
+                $rules['entries.*.quantity'] = 'required|integer|min:1';
+                $rules['entries.*.timestamp'] = 'required|integer';
+            }
+            
+            $validator = Validator::make($request->all(), $rules);
 
             if ($validator->fails()) {
                 Log::warning('❌ TokenData Update Validation Failed', [
@@ -903,27 +970,47 @@ class TokenDataController extends Controller
                 ], 422);
             }
 
-            // Recalculate counts from entries
-            $counts = [];
-            for ($i = 0; $i < 10; $i++) {
-                $counts[$i] = 0;
-            }
-            foreach ($request->entries as $entry) {
-                if (isset($entry['number']) && isset($entry['quantity'])) {
-                    $number = (int)$entry['number'];
-                    $quantity = (int)$entry['quantity'];
-                    if ($number >= 0 && $number <= 9) {
-                        $counts[$number] += $quantity;
+            // Prepare update data
+            $updateData = [
+                'saved_at' => now(),
+            ];
+
+            // Recalculate counts from entries if entries are provided
+            if ($request->has('entries')) {
+                $counts = [];
+                for ($i = 0; $i < 10; $i++) {
+                    $counts[$i] = 0;
+                }
+                foreach ($request->entries as $entry) {
+                    if (isset($entry['number']) && isset($entry['quantity'])) {
+                        $number = (int)$entry['number'];
+                        $quantity = (int)$entry['quantity'];
+                        if ($number >= 0 && $number <= 9) {
+                            $counts[$number] += $quantity;
+                        }
                     }
                 }
+                $updateData['entries'] = $request->entries;
+                $updateData['counts'] = $counts;
             }
 
-            // Update the record
-            $tokenData->update([
-                'entries' => $request->entries,
-                'counts' => $counts,
-                'saved_at' => now(),
+            // Add winner if provided
+            if ($request->has('winner')) {
+                $updateData['winner'] = $request->winner !== null ? (int)$request->winner : null;
+                Log::info('🎯 Winner value to update', [
+                    'winner' => $updateData['winner'],
+                    'original_value' => $request->winner,
+                ]);
+            }
+
+            Log::info('📝 Preparing to update token data', [
+                'update_data' => $updateData,
+                'has_entries' => $request->has('entries'),
+                'has_winner' => $request->has('winner'),
             ]);
+
+            // Update the record
+            $tokenData->update($updateData);
 
             Log::info('✅ TokenData Updated Successfully', [
                 'user_id' => $userId,
@@ -931,7 +1018,8 @@ class TokenDataController extends Controller
                 'time_slot_id' => $tokenData->time_slot_id,
                 'date' => $tokenData->date,
                 'time_slot' => $tokenData->time_slot,
-                'entries_count' => count($request->entries),
+                'entries_count' => $request->has('entries') ? count($request->entries) : 'not updated',
+                'winner' => $request->has('winner') ? $updateData['winner'] : 'not updated',
                 'updated_at' => now()->toDateTimeString(),
             ]);
 
@@ -942,17 +1030,24 @@ class TokenDataController extends Controller
             ], 200);
 
         } catch (\Exception $e) {
-            Log::error('Error updating token data', [
+            Log::error('❌ Error updating token data', [
                 'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
                 'trace' => $e->getTraceAsString(),
                 'id' => $id,
                 'user_id' => auth()->id(),
+                'request_data' => $request->all(),
             ]);
 
             return response()->json([
                 'success' => false,
                 'message' => 'Failed to update token data',
                 'error' => config('app.debug') ? $e->getMessage() : 'Internal server error',
+                'debug' => config('app.debug') ? [
+                    'file' => $e->getFile(),
+                    'line' => $e->getLine(),
+                ] : null,
             ], 500);
         }
     }

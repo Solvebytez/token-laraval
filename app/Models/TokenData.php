@@ -18,6 +18,7 @@ class TokenData extends Model
         'time_slot',
         'entries',
         'counts',
+        'winner',
         'saved_at',
     ];
 
